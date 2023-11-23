@@ -1,53 +1,118 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        mpsc::{sync_channel, Receiver, SyncSender},
+        Arc,
+    },
+};
 
-pub struct GitFinder {
-    entries: Vec<String>,
+use crate::args::Args;
+
+#[derive(Debug, Clone)]
+pub struct Options {
+    parellel: usize,
+    chan_size: usize,
     recursive: bool,
 }
 
-impl GitFinder {
-    pub fn new(entries: Vec<String>, recursive: bool) -> GitFinder {
-        GitFinder { entries, recursive }
+impl From<Args> for Options {
+    fn from(value: Args) -> Self {
+        let threads = value.parallel.unwrap_or(num_cpus::get() as usize);
+        Options {
+            parellel: threads,
+            chan_size: 1024, // change to a reasonable value?
+            recursive: value.recursive,
+        }
     }
 }
 
-impl Iterator for GitFinder {
+pub struct Finder {
+    walk: Option<Box<dyn FnOnce()>>,
+    collector: Receiver<String>,
+}
+
+impl Finder {
+    pub fn new(entries: Vec<String>, filter: fn(&PathBuf) -> bool, opts: Options) -> Finder {
+        let (sender, collector) = sync_channel(opts.chan_size);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(opts.parellel)
+            .build()
+            .unwrap();
+        let pool = Arc::new(pool);
+
+        let walk = move || {
+            let walker = Walker::new(pool.clone(), sender, filter, opts.recursive);
+            for entry in entries {
+                let walker = walker.clone();
+                pool.spawn(move || {
+                    walker.scan(PathBuf::from(entry));
+                })
+            }
+        };
+
+        Finder {
+            walk: Some(Box::new(walk)),
+            collector,
+        }
+    }
+}
+
+impl Iterator for Finder {
     type Item = String;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let entry = match self.entries.pop() {
-                Some(entry) => entry,
-                _ => break,
-            };
-
-            let mut root = PathBuf::from(entry);
-            let is_git = is_git_project(&mut root);
-
-            if !is_git || self.recursive {
-                self.entries
-                    .extend(root.as_path().read_dir().ok()?.filter_map(|entry| {
-                        let entry = entry.ok()?.path();
-                        if !entry.ends_with(".git") && entry.is_dir() {
-                            entry.to_str().map(String::from)
-                        } else {
-                            None
-                        }
-                    }));
-            }
-
-            if is_git {
-                return root.to_str().and_then(|x| Some(x.to_owned()));
-            }
+    fn next(&mut self) -> Option<String> {
+        if let Some(walk) = self.walk.take() {
+            walk();
         }
-
-        None
+        self.collector.recv().ok()
     }
 }
 
-fn is_git_project(folder: &mut PathBuf) -> bool {
-    folder.push(".git");
-    let flg = folder.is_dir();
-    folder.pop();
-    flg
+#[derive(Debug, Clone)]
+struct Walker {
+    pool: Arc<rayon::ThreadPool>,
+    chan: SyncSender<String>,
+    filter: fn(&PathBuf) -> bool,
+    recursive: bool,
+}
+
+impl Walker {
+    fn new(
+        pool: Arc<rayon::ThreadPool>,
+        chan: SyncSender<String>,
+        filter: fn(&PathBuf) -> bool,
+        recursive: bool,
+    ) -> Walker {
+        Walker {
+            pool,
+            chan,
+            filter,
+            recursive,
+        }
+    }
+
+    fn scan(&self, path: PathBuf) {
+        let flag = (self.filter)(&path);
+
+        if flag {
+            let path = path.to_str().unwrap().to_owned();
+            _ = self.chan.send(path);
+        }
+
+        if !path.is_dir() || (flag && !self.recursive) {
+            return;
+        }
+
+        for entry in path.read_dir().unwrap() {
+            let entry = entry.unwrap();
+            if !entry.metadata().unwrap().is_dir() {
+                continue;
+            }
+            let walker = self.clone();
+            self.pool.spawn(move || {
+                walker.scan(entry.path());
+            });
+        }
+    }
 }
