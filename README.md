@@ -1,18 +1,25 @@
-# git-finder
+# fdir(find directory)
 
-Find all git projects under given root folder.
+Find all folders in the given root directory that contain the specified folder or file.
 
-Usage:
+For examples:
 
-```shell
-> git-finder ~/repos
-```
-
-A more useful example, quick jump to project folder:
+Find all git projects in `~/repos` folder:
 
 ```shell
-cd $(echo $REPOS | xargs git-finder | fzf)
+> fdir ~/repos
 ```
 
-We could do the same with `find` or `fd` command, but they can not stop search
-sub folder in a git project, so I write one for my self.
+Find all rust projects in folder:
+
+```shell
+> fdir --has "Cargo.toml" ~/repos
+```
+
+After finding all the folders, combining them with the `fzf` and `cd` commands allows us to quickly navigate to the desired project or file directory.
+
+```fish
+cd $(echo $REPOS | xargs fdir | fzf)
+```
+
+Similar effects can also be achieved using the `find` or `fd` tools, but they cannot stop searching their subdirectories once a matching directory is found. For large projects with many subdirectories, this can consume more time, so I decided to optimize the process."
