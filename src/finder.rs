@@ -32,7 +32,10 @@ pub struct Finder {
 }
 
 impl Finder {
-    pub fn new(entries: Vec<String>, filter: fn(&PathBuf) -> bool, opts: Options) -> Finder {
+    pub fn new<F>(entries: Vec<String>, filter: Arc<F>, opts: Options) -> Finder
+    where
+        F: Fn(&PathBuf) -> bool + Send + Sync + 'static,
+    {
         let (sender, collector) = sync_channel(opts.chan_size);
 
         let pool = rayon::ThreadPoolBuilder::new()
@@ -42,7 +45,7 @@ impl Finder {
         let pool = Arc::new(pool);
 
         let walk = move || {
-            let walker = Walker::new(pool.clone(), sender, filter, opts.recursive);
+            let walker = Walker::new(pool.clone(), sender, filter.clone(), opts.recursive);
             for entry in entries {
                 let walker = walker.clone();
                 pool.spawn(move || {
@@ -69,21 +72,24 @@ impl Iterator for Finder {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Walker {
     pool: Arc<rayon::ThreadPool>,
     chan: SyncSender<String>,
-    filter: fn(&PathBuf) -> bool,
+    filter: Arc<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>,
     recursive: bool,
 }
 
 impl Walker {
-    fn new(
+    fn new<F>(
         pool: Arc<rayon::ThreadPool>,
         chan: SyncSender<String>,
-        filter: fn(&PathBuf) -> bool,
+        filter: Arc<F>,
         recursive: bool,
-    ) -> Walker {
+    ) -> Self
+    where
+        F: Fn(&PathBuf) -> bool + Send + Sync + 'static,
+    {
         Walker {
             pool,
             chan,
