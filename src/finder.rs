@@ -6,119 +6,91 @@ use std::{
     },
 };
 
-use crate::args::Args;
-
-#[derive(Debug, Clone)]
-pub struct Options {
-    parellel: usize,
-    chan_size: usize,
-    recursive: bool,
+#[derive(Debug)]
+pub struct Filter {
+    has_file: Option<String>,
 }
 
-impl From<Args> for Options {
-    fn from(value: Args) -> Self {
-        let threads = value.parallel.unwrap_or(num_cpus::get() as usize);
-        Options {
-            parellel: threads,
-            chan_size: 1024, // change to a reasonable value?
-            recursive: value.recursive,
+impl Filter {
+    pub fn new() -> Self {
+        Self { has_file: None }
+    }
+
+    pub fn has(mut self, file: String) -> Self {
+        self.has_file = Some(file);
+        self
+    }
+
+    fn do_filter(&self, path: &PathBuf) -> bool {
+        if let Some(ref file) = self.has_file {
+            path.join(file).exists()
+        } else {
+            false
         }
     }
 }
 
+#[derive(Debug)]
+pub struct Config {
+    recursive: bool,
+}
+
+impl Config {
+    pub fn new(recursive: bool) -> Self {
+        Config { recursive }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Finder {
-    walk: Option<Box<dyn FnOnce()>>,
-    collector: Receiver<String>,
+    pool: Arc<rayon::ThreadPool>,
+    filter: Arc<Filter>,
+    config: Arc<Config>,
 }
 
 impl Finder {
-    pub fn new<F>(entries: Vec<String>, filter: Arc<F>, opts: Options) -> Finder
-    where
-        F: Fn(&PathBuf) -> bool + Send + Sync + 'static,
-    {
-        let (sender, collector) = sync_channel(opts.chan_size);
-
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(opts.parellel)
-            .build()
-            .unwrap();
-        let pool = Arc::new(pool);
-
-        let walk = move || {
-            let walker = Walker::new(pool.clone(), sender, filter.clone(), opts.recursive);
-            for entry in entries {
-                let walker = walker.clone();
-                pool.spawn(move || {
-                    walker.scan(PathBuf::from(entry));
-                })
-            }
-        };
-
+    pub fn new(pool: Arc<rayon::ThreadPool>, filter: Filter, config: Config) -> Finder {
         Finder {
-            walk: Some(Box::new(walk)),
-            collector,
-        }
-    }
-}
-
-impl Iterator for Finder {
-    type Item = String;
-
-    fn next(&mut self) -> Option<String> {
-        if let Some(walk) = self.walk.take() {
-            walk();
-        }
-        self.collector.recv().ok()
-    }
-}
-
-#[derive(Clone)]
-struct Walker {
-    pool: Arc<rayon::ThreadPool>,
-    chan: SyncSender<String>,
-    filter: Arc<dyn Fn(&PathBuf) -> bool + Send + Sync + 'static>,
-    recursive: bool,
-}
-
-impl Walker {
-    fn new<F>(
-        pool: Arc<rayon::ThreadPool>,
-        chan: SyncSender<String>,
-        filter: Arc<F>,
-        recursive: bool,
-    ) -> Self
-    where
-        F: Fn(&PathBuf) -> bool + Send + Sync + 'static,
-    {
-        Walker {
             pool,
-            chan,
-            filter,
-            recursive,
+            filter: Arc::new(filter),
+            config: Arc::new(config),
         }
     }
 
-    fn scan(&self, path: PathBuf) {
-        let flag = (self.filter)(&path);
+    pub fn scan(&self, start_paths: Vec<String>) -> Receiver<String> {
+        let (tx, rx) = sync_channel(1000);
+        for path in start_paths.iter() {
+            let tx = tx.clone();
+            let path = PathBuf::from(path);
+            let walker = self.clone();
+            self.pool.spawn(move || walker.scan_path(path, tx))
+        }
+
+        rx
+    }
+
+    fn scan_path(&self, entry: PathBuf, tx: SyncSender<String>) {
+        let flag = self.filter.do_filter(&entry);
 
         if flag {
-            let path = path.to_str().unwrap().to_owned();
-            _ = self.chan.send(path);
+            let path = entry.to_str().unwrap().to_owned();
+            _ = tx.send(path);
         }
 
-        if !path.is_dir() || (flag && !self.recursive) {
+        if !entry.is_dir() || (flag && !self.config.recursive) {
             return;
         }
 
-        for entry in path.read_dir().unwrap() {
+        for entry in entry.read_dir().unwrap() {
             let entry = entry.unwrap();
             if !entry.metadata().unwrap().is_dir() {
                 continue;
             }
+            let tx = tx.clone();
             let walker = self.clone();
             self.pool.spawn(move || {
-                walker.scan(entry.path());
-            });
+                walker.scan_path(entry.path(), tx);
+            })
         }
     }
 }

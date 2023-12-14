@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use clap::Parser;
 
@@ -6,18 +6,27 @@ mod args;
 mod finder;
 
 use args::Args;
-use finder::Finder;
+
+use finder::{Config, Filter, Finder};
 
 fn main() {
     let args = Args::parse();
 
     let roots = args.roots.clone();
-    let search = args.search_file.clone();
-    let filter = move |path: &PathBuf| path.join(search.as_str()).exists();
 
-    let finder = Finder::new(roots, Arc::new(filter), args.into());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.parallel.unwrap_or(num_cpus::get()))
+        .build()
+        .unwrap();
+    let pool = Arc::new(pool);
 
-    for proj in finder {
+    let finder = Finder::new(
+        pool,
+        Filter::new().has(args.search_file.clone()),
+        Config::new(args.recursive),
+    );
+
+    for proj in finder.scan(roots).into_iter() {
         println!("{}", proj);
     }
 }
